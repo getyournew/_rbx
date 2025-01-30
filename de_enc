@@ -1,0 +1,72 @@
+local module = {}
+
+function module:encode(str)
+    local reversed = string.reverse(str)
+    local bytes = {}
+    for i = 1, #reversed do
+        bytes[i] = string.byte(reversed, i)
+    end
+
+    local noisy = {}
+    local seed = #bytes * 31337
+    math.randomseed(seed)
+    for i, v in ipairs(bytes) do
+        table.insert(noisy, v)
+        table.insert(noisy, math.random(1, 255))
+    end
+
+    local encoded = {}
+    local key = (#noisy * 7 + 12345) % 256
+    for i, v in ipairs(noisy) do
+        local dynamic_key = (key + i * 911) % 256
+        local mutated = bit32.bxor(v, dynamic_key)
+        mutated = bit32.bxor(mutated, i % 256)
+        table.insert(encoded, mutated)
+    end
+
+    local custom_b64 = ""
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for i, v in ipairs(encoded) do
+        local b1 = bit32.band(v, 0xFC) / 4
+        local b2 = bit32.band(v, 0x03) * 16
+        if i < #encoded then
+            b2 = b2 + bit32.band(encoded[i+1], 0xF0) / 16
+        end
+        custom_b64 = custom_b64 .. alphabet:sub(b1+1, b1+1) .. alphabet:sub(b2+1, b2+1)
+    end
+
+    return custom_b64
+end
+
+function module:decode(encoded)
+    local decoded_bytes = {}
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for i = 1, #encoded, 2 do
+        local c1 = encoded:sub(i, i)
+        local c2 = encoded:sub(i+1, i+1)
+        local b1 = alphabet:find(c1) - 1
+        local b2 = alphabet:find(c2) - 1
+        local byte1 = bit32.bor(bit32.lshift(b1, 2), bit32.rshift(b2, 4))
+        table.insert(decoded_bytes, byte1)
+    end
+
+    local noisy = {}
+    local key = (#decoded_bytes * 7 + 12345) % 256
+    for i, v in ipairs(decoded_bytes) do
+        local dynamic_key = (key + i * 911) % 256
+        local original = bit32.bxor(v, i % 256)
+        original = bit32.bxor(original, dynamic_key)
+        table.insert(noisy, original)
+    end
+
+    local bytes = {}
+    for i = 1, #noisy, 2 do
+        table.insert(bytes, noisy[i])
+    end
+
+    local reversed = string.char(unpack(bytes))
+    return string.reverse(reversed)
+end
+
+
+return module
