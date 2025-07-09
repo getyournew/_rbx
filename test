@@ -1,155 +1,144 @@
-
-------------------------------------------------------------------
--- SERVICES
-------------------------------------------------------------------
-local RunService   = game:GetService("RunService")
+----------------------------------------------------------
 local Players      = game:GetService("Players")
-local Physics      = game:GetService("PhysicsService")
+local RunService   = game:GetService("RunService")
 local Workspace    = game:GetService("Workspace")
 
 local lp = Players.LocalPlayer
 
-------------------------------------------------------------------
+----------------------------------------------------------
 -- CONFIG
-------------------------------------------------------------------
-local VELOCITY_HARD_LIMIT   = 60      -- stud/s
-local ANGULAR_HARD_LIMIT    = 80      -- rad/s
-local NOCOLLIDE_RADIUS      = 6       -- xoá part lạ <6 stud
-local SAFE_HEIGHT_FLOOR     = -30     -- rơi dưới thì hồi về
-local ANCHOR_TIME           = 0.08    -- số giây khóa nhân vật khi reset
-local VERBOSE_PRINT         = false   -- bật log
+----------------------------------------------------------
+local TRIGGER_VEL_LIN      = 60      -- vượt ngưỡng => khóa
+local TRIGGER_VEL_ANG      = 80
+local SAFE_FLOOR_Y         = -30
+local RELEASE_VEL_LIN      = 10      -- dưới ngưỡng => xem xét mở khóa
+local RELEASE_VEL_ANG      = 10
+local STABLE_FRAMES_NEEDED = 10      -- số frame liên tiếp thỏa mãn mới thả
+local MAX_LOCK_TIME        = 8       -- đề phòng kẹt vĩnh viễn (s)
+local VERBOSE              = false
 
-------------------------------------------------------------------
+----------------------------------------------------------
 -- UTIL
-------------------------------------------------------------------
-local function dprint(...) if VERBOSE_PRINT then print("[AF]", ...) end end
+----------------------------------------------------------
+local function log(...) if VERBOSE then print("[UltraLock]", ...) end end
 
-local function dangerousBody(obj: Instance): boolean
-	return obj:IsA("BodyMover") or obj:IsA("BodyGyro") or obj:IsA("BodyForce")
-		or obj:IsA("VectorForce") or obj:IsA("Torque") or obj:IsA("Constraint")
+local function isDangerObj(obj: Instance)
+	return obj:IsA("BodyMover") or obj:IsA("Constraint")
+		or obj:IsA("VectorForce") or obj:IsA("Torque")
 		or obj:IsA("LinearVelocity") or obj:IsA("AngularVelocity")
 end
 
-------------------------------------------------------------------
--- MAIN PROTECTION
-------------------------------------------------------------------
+----------------------------------------------------------
+-- CORE
+----------------------------------------------------------
 local function protect(char: Model)
-	local hrp   = char:WaitForChild("HumanoidRootPart", 3)
-	local hum   = char:WaitForChild("Humanoid", 3)
+	local hrp = char:WaitForChild("HumanoidRootPart", 4)
+	local hum = char:WaitForChild("Humanoid", 4)
 	if not hrp or not hum then return end
 
-	-- tạo collision group riêng cho player để noclip part lạ dễ
-	pcall(function()
-		if not Physics:CollisionGroupExists("AntiFlingPlayer") then
-			Physics:CreateCollisionGroup("AntiFlingPlayer")
-			Physics:CollisionGroupSetCollidable("AntiFlingPlayer", "Default", true)
-		end
-	end)
-	for _,p in ipairs(char:GetDescendants()) do
-		if p:IsA("BasePart") then
-			p.CollisionGroup = "AntiFlingPlayer"
-		end
-	end
-	char.DescendantAdded:Connect(function(part)
-		if part:IsA("BasePart") then
-			part.CollisionGroup = "AntiFlingPlayer"
-		end
-	end)
-
-	-- xoá bodymover/constraint mới gắn
+	------------------------------------------------------------------
+	-- 1. Hủy mọi bodymover/constraint lạ
+	------------------------------------------------------------------
 	local function onDescAdded(obj)
-		if dangerousBody(obj) then
-			dprint("Destroy body mover:",obj.ClassName)
+		if isDangerObj(obj) then
+			log("Destroy", obj.ClassName)
 			obj:Destroy()
 		end
 	end
-	-- quét lần đầu
 	for _,d in ipairs(char:GetDescendants()) do onDescAdded(d) end
 	char.DescendantAdded:Connect(onDescAdded)
 
 	------------------------------------------------------------------
-	-- RESET ROUTINE
+	-- 2. Lock / Unlock helpers
 	------------------------------------------------------------------
+	local locked = false
+	local stableFrames = 0
+	local lockStart = 0
 	local safeCF = hrp.CFrame
-	local lastReset = 0
-	local anchoring = false
+	local anchoredOld = {}
 
-	local function hardReset()
-		if tick()-lastReset < 0.3 then return end -- tránh spam
-		lastReset = tick()
-
-		anchoring = true
-		local oldAnchors = {}
-		for _,bp in ipairs(char:GetDescendants()) do
-			if bp:IsA("BasePart") then
-				oldAnchors[bp] = bp.Anchored
-				bp.Anchored = true
-				bp.Velocity     = Vector3.zero
-				bp.RotVelocity  = Vector3.zero
+	local function anchorAll(state: boolean)
+		for _,p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then
+				if state then
+					anchoredOld[p] = p.Anchored
+					p.Anchored   = true
+					p.Velocity   = Vector3.zero
+					p.RotVelocity= Vector3.zero
+				else
+					if anchoredOld[p] ~= nil and p.Parent then
+						p.Anchored = anchoredOld[p]
+					end
+				end
 			end
 		end
+	end
 
+	local function hardLock()
+		if locked then return end
+		locked = true
+		lockStart = tick()
+		stableFrames = 0
+		anchorAll(true)
 		hrp.CFrame = safeCF
+		log("⚠️ LOCKED")
+	end
 
-		task.delay(ANCHOR_TIME, function()
-			for part,old in pairs(oldAnchors) do
-				if part and part.Parent then part.Anchored = old end
+	local function tryUnlock()
+		if not locked then return end
+		-- kiểm tra mọi điều kiện an toàn
+		if hrp.Velocity.Magnitude   < RELEASE_VEL_LIN
+		and hrp.RotVelocity.Magnitude < RELEASE_VEL_ANG
+		and not hrp:FindFirstChildWhichIsA("BodyMover", true)
+		and not hrp:FindFirstChildWhichIsA("Constraint", true)
+		then
+			stableFrames += 1
+			if stableFrames >= STABLE_FRAMES_NEEDED
+			or tick() - lockStart > MAX_LOCK_TIME then
+				locked = false
+				anchorAll(false)
+				log("✅ UNLOCKED")
 			end
-			anchoring = false
-		end)
+		else
+			stableFrames = 0 -- reset bộ đếm khi còn lực
+		end
 	end
 
 	------------------------------------------------------------------
-	-- WATCH DOG (Stepped)
+	-- 3. Watch-dog mỗi frame
 	------------------------------------------------------------------
-	RunService.Stepped:Connect(function(_,dt)
+	RunService.Stepped:Connect(function()
 		if not hrp.Parent then return end
-		if anchoring then return end
 
-		-- update safeCF khi bình thường
-		if hrp.Velocity.Magnitude < VELOCITY_HARD_LIMIT/2
-			and hrp.RotVelocity.Magnitude < ANGULAR_HARD_LIMIT/2
-			and hrp.Position.Y > SAFE_HEIGHT_FLOOR
+		-- Cập nhật vị trí an toàn khi… an toàn
+		if not locked
+		and hrp.Velocity.Magnitude   < TRIGGER_VEL_LIN/2
+		and hrp.RotVelocity.Magnitude< TRIGGER_VEL_ANG/2
+		and hrp.Position.Y > SAFE_FLOOR_Y
 		then
 			safeCF = hrp.CFrame
 		end
 
-		-- nếu vượt ngưỡng ⇒ reset
-		if hrp.Velocity.Magnitude > VELOCITY_HARD_LIMIT
-			or hrp.RotVelocity.Magnitude > ANGULAR_HARD_LIMIT
-			or hrp.Position.Y < SAFE_HEIGHT_FLOOR
-		then
-			dprint("⚠️ Hard Reset | V=",hrp.Velocity.Magnitude," Rot=",hrp.RotVelocity.Magnitude)
-			hardReset()
+		-- Khi đã khoá → chỉ xét mở khoá
+		if locked then
+			tryUnlock()
+			return
 		end
 
-		-- Xoá part nhẹ (massless) bay vào người
-		for _,part in ipairs(Workspace:GetPartBoundsInBox(hrp.CFrame,
-			Vector3.new(NOCOLLIDE_RADIUS,NOCOLLIDE_RADIUS,NOCOLLIDE_RADIUS))) do
-
-			if part:IsA("BasePart") and part.CanCollide
-				and not part:IsDescendantOf(char)
-				and part.AssemblyMass < 2 -- cực nhẹ, nghi vấn 
-			then
-				dprint("Delete suspect part:", part:GetFullName())
-				part:Destroy()
-			end
+		-- Chưa khoá → phát hiện fling?
+		if hrp.Velocity.Magnitude   > TRIGGER_VEL_LIN
+		or hrp.RotVelocity.Magnitude> TRIGGER_VEL_ANG
+		or hrp.Position.Y < SAFE_FLOOR_Y
+		or hrp:FindFirstChildWhichIsA("BodyMover", true)
+		or hrp:FindFirstChildWhichIsA("Constraint", true)
+		then
+			hardLock()
 		end
 	end)
-
-	------------------------------------------------------------------
-	-- GIỮ NETWORK OWNERSHIP (executor safe)
-	------------------------------------------------------------------
-	local ok, setsim = pcall(function() return setsimulationradius end)
-	if ok and typeof(setsim)=="function" then
-		RunService.RenderStepped:Connect(function()
-			setsim(1e3,1e3)
-		end)
-	end
 end
 
-------------------------------------------------------------------
--- HOOK CHARACTER
-------------------------------------------------------------------
+----------------------------------------------------------
+-- BẮT ĐẦU
+----------------------------------------------------------
 if lp.Character then task.spawn(protect, lp.Character) end
 lp.CharacterAdded:Connect(function(c) task.spawn(protect, c) end)
